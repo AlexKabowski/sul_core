@@ -1,0 +1,15 @@
+[package]
+name = "sul_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blake3 = "1"
+rust-randomx = "0.7.6"
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+bulletproofs = "5"
+merlin = "3"
+rand_core = "0.6"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
