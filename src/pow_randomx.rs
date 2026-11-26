@@ -101,6 +101,32 @@ impl U512 {
         }
     }
 
+    fn checked_add_one(&mut self) -> bool {
+        for limb in &mut self.limbs {
+            let (value, carry) = limb.overflowing_add(1);
+            *limb = value;
+            if !carry {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn div(&self, divisor: &Self) -> Self {
+        assert!(divisor.bit_len() > 0, "division by zero in U512::div");
+        let mut quotient = U512::zero();
+        let mut remainder = U512::zero();
+        for bit_idx in (0..self.bit_len()).rev() {
+            remainder.shl_1();
+            remainder.limbs[0] |= self.bit(bit_idx);
+            if remainder.cmp(divisor) != std::cmp::Ordering::Less {
+                remainder.sub_assign(divisor);
+                quotient.set_bit(bit_idx);
+            }
+        }
+        quotient
+    }
+
     fn mul_u128(&self, rhs: u128) -> Self {
         let lo_rhs = rhs as u64;
         let hi_rhs = (rhs >> 64) as u64;
@@ -158,6 +184,71 @@ impl U512 {
             }
         }
         quotient
+    }
+}
+
+/// Exact accumulated proof-of-work value, stored as a big-endian 512-bit integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChainWork([u64; 8]);
+
+impl ChainWork {
+    pub const ZERO: Self = Self([0; 8]);
+
+    /// Calculates `floor(2^256 / (target + 1))` without narrowing intermediate values.
+    pub fn from_difficulty_target(target: &Hash256) -> Self {
+        let mut divisor = U512::from_be_bytes_256(target);
+        assert!(
+            divisor.checked_add_one(),
+            "256-bit target increment fits U512"
+        );
+        let mut numerator = U512::zero();
+        numerator.set_bit(256);
+        Self(numerator.div(&divisor).limbs)
+    }
+
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        let mut sum = [0u64; 8];
+        let mut carry = 0u128;
+        for (index, limb) in sum.iter_mut().enumerate() {
+            let value = self.0[index] as u128 + other.0[index] as u128 + carry;
+            *limb = value as u64;
+            carry = value >> 64;
+        }
+        (carry == 0).then_some(Self(sum))
+    }
+}
+
+impl Default for ChainWork {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+impl PartialOrd for ChainWork {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ChainWork {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for index in (0..8).rev() {
+            match self.0[index].cmp(&other.0[index]) {
+                std::cmp::Ordering::Equal => {}
+                ordering => return ordering,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+impl fmt::Display for ChainWork {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("0x")?;
+        for limb in self.0.iter().rev() {
+            write!(formatter, "{limb:016x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -492,6 +583,37 @@ impl RandomXHasher for RealRandomXHasher {
 mod tests {
     use super::*;
     use crate::params::DIFFICULTY_RETARGET_WINDOW_BLOCKS;
+
+    #[test]
+    fn chainwork_uses_exact_target_division_and_checked_512_bit_addition() {
+        let unit_work = ChainWork::from_difficulty_target(&[0xFF; 32]);
+        assert_eq!(unit_work.0[0], 1);
+        assert!(unit_work.0[1..].iter().all(|limb| *limb == 0));
+
+        let zero_target_work = ChainWork::from_difficulty_target(&[0; 32]);
+        assert_eq!(zero_target_work.0[4], 1);
+        assert!(zero_target_work
+            .0
+            .iter()
+            .enumerate()
+            .all(|(index, limb)| *limb == u64::from(index == 4)));
+
+        let mut half_range_target = [0; 32];
+        half_range_target[16..].fill(0xFF);
+        let large_work = ChainWork::from_difficulty_target(&half_range_target);
+        assert_eq!(large_work.0[2], 1);
+        assert!(large_work
+            .0
+            .iter()
+            .enumerate()
+            .all(|(index, limb)| *limb == u64::from(index == 2)));
+
+        let two_work = ChainWork::from_difficulty_target(&[0x7F; 32]);
+        assert_eq!(two_work.0[0], 2);
+        assert_eq!(unit_work.checked_add(unit_work), Some(two_work));
+
+        assert_eq!(ChainWork([u64::MAX; 8]).checked_add(unit_work), None);
+    }
 
     #[test]
     fn retarget_respects_half_and_double_limits() {

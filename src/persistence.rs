@@ -11,8 +11,8 @@ use crate::pow_randomx::Hash256;
 const SNAPSHOT_FILE: &str = "state_snapshot.bin";
 const BLOCKS_DIRECTORY: &str = "blocks";
 const FILE_MAGIC: &[u8; 8] = b"SULPERS1";
-const BLOCK_SCHEMA_VERSION: u32 = 1;
-const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+const BLOCK_SCHEMA_VERSION: u32 = 2;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 const HEADER_SIZE: usize = FILE_MAGIC.len() + 4 + 8;
 const CHECKSUM_SIZE: usize = 32;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -211,7 +211,8 @@ fn hex_hash(hash: &Hash256) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_engine::ChainEngine;
+    use crate::chain_engine::{compute_block_merkle_root, Block, ChainEngine};
+    use crate::pow_randomx::BlockHeader;
 
     fn temp_dir(name: &str) -> PathBuf {
         let path =
@@ -271,6 +272,31 @@ mod tests {
             store.load_engine_snapshot(),
             Err(PersistenceError::MissingFile(_))
         ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn block_roundtrip_preserves_committed_reward_recipient() {
+        let dir = temp_dir("block_roundtrip");
+        let store = DiskStore::new(&dir).unwrap();
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                height: 0,
+                prev_block_hash: [0; 32],
+                merkle_root: compute_block_merkle_root(&[], "alice"),
+                timestamp: 1_700_000_000,
+                difficulty_target: [0xFF; 32],
+                nonce: 0,
+            },
+            reward_recipient: "alice".into(),
+            txs: Vec::new(),
+        };
+        let hash = block.header.structural_digest();
+
+        store.write_block(&hash, &block).unwrap();
+        assert_eq!(store.read_block(&hash).unwrap(), block);
+
         fs::remove_dir_all(dir).unwrap();
     }
 }

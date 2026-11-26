@@ -7,8 +7,8 @@ use crate::params::{
     ANTI_SPAM_ANCHOR_WINDOW_BLOCKS, DIFFICULTY_RETARGET_WINDOW_BLOCKS, MEDIAN_TIME_PAST_BLOCKS,
 };
 use crate::pow_randomx::{
-    retarget_difficulty_with_window, BlockHeader, ConsensusError, Hash256, RandomXHasher,
-    MAX_DIFFICULTY_TARGET, MIN_DIFFICULTY_TARGET,
+    retarget_difficulty_with_window, BlockHeader, ChainWork, ConsensusError, Hash256,
+    RandomXHasher, MAX_DIFFICULTY_TARGET, MIN_DIFFICULTY_TARGET,
 };
 use crate::privacy::Key32;
 
@@ -41,6 +41,7 @@ pub fn hybrid_tx_key_images(tx: &HybridTx) -> Vec<Key32> {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
+    pub reward_recipient: String,
     pub txs: Vec<HybridTx>,
 }
 
@@ -48,7 +49,7 @@ pub struct Block {
 pub struct StoredBlockInfo {
     pub hash: Hash256,
     pub parent_hash: Option<Hash256>,
-    pub chainwork: u128,
+    pub chainwork: ChainWork,
     pub occupancy_ppm: u128,
     pub block: Block,
 }
@@ -56,6 +57,9 @@ pub struct StoredBlockInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainEngineError {
     MerkleRootMismatch { expected: Hash256, actual: Hash256 },
+    EmptyRewardRecipient,
+    RewardRecipientMismatch { supplied: String, committed: String },
+    ChainWorkOverflow,
     TooManyTransactions { actual: usize, max: usize },
     MempoolFull { max: usize },
     DuplicateTx(Hash256),
@@ -72,6 +76,15 @@ impl fmt::Display for ChainEngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MerkleRootMismatch { .. } => write!(f, "invalid merkle_root in block header"),
+            Self::EmptyRewardRecipient => write!(f, "block reward recipient must not be empty"),
+            Self::RewardRecipientMismatch {
+                supplied,
+                committed,
+            } => write!(
+                f,
+                "submitted reward recipient {supplied} differs from block commitment {committed}"
+            ),
+            Self::ChainWorkOverflow => write!(f, "accumulated chainwork exceeds 512 bits"),
             Self::TooManyTransactions { actual, max } => {
                 write!(f, "block exceeds transaction limit: {actual} > {max}")
             }
@@ -207,9 +220,22 @@ pub fn compute_merkle_root(txs: &[HybridTx]) -> Hash256 {
     level[0]
 }
 
+/// Commits both the transaction tree and reward recipient into the block header.
+pub fn compute_block_merkle_root(txs: &[HybridTx], reward_recipient: &str) -> Hash256 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"SUL_BLOCK_CONTENT_ROOT_V1");
+    hasher.update(&(reward_recipient.len() as u64).to_le_bytes());
+    hasher.update(reward_recipient.as_bytes());
+    hasher.update(&compute_merkle_root(txs));
+    *hasher.finalize().as_bytes()
+}
+
 impl Block {
     pub fn verify_merkle_root(&self) -> Result<(), ChainEngineError> {
-        let actual = compute_merkle_root(&self.txs);
+        if self.reward_recipient.trim().is_empty() {
+            return Err(ChainEngineError::EmptyRewardRecipient);
+        }
+        let actual = compute_block_merkle_root(&self.txs, &self.reward_recipient);
         if actual != self.header.merkle_root {
             return Err(ChainEngineError::MerkleRootMismatch {
                 expected: self.header.merkle_root,
@@ -339,7 +365,7 @@ struct StoredNode {
     block: Block,
     hash: Hash256,
     parent_hash: Option<Hash256>,
-    chainwork: u128,
+    chainwork: ChainWork,
     occupancy_ppm: u128,
 }
 
@@ -353,15 +379,6 @@ pub struct ChainEngine {
     nodes: HashMap<Hash256, StoredNode>,
     canonical_hashes: Vec<Hash256>,
     pub mempool: Mempool,
-}
-
-/// Estimates work from the target's most significant byte; a lower target indicates more work.
-/// This approximation must not be used as the definitive production chainwork calculation.
-fn approx_block_work(target: &Hash256) -> u128 {
-    let leading_zeros = target.iter().take_while(|&&b| b == 0).count() as u32;
-    let first_non_zero = target.iter().copied().find(|&b| b != 0).unwrap_or(1) as u128;
-    let scale = (256u128 / first_non_zero.max(1)).max(1);
-    scale.saturating_add((leading_zeros as u128).saturating_mul(1_000))
 }
 
 impl ChainEngine {
@@ -386,11 +403,11 @@ impl ChainEngine {
     }
 
     /// Returns accumulated work for the canonical tip, or zero for an empty chain.
-    pub fn current_tip_work(&self) -> u128 {
+    pub fn current_tip_work(&self) -> ChainWork {
         self.tip_hash()
             .and_then(|hash| self.nodes.get(&hash))
             .map(|node| node.chainwork)
-            .unwrap_or(0)
+            .unwrap_or(ChainWork::ZERO)
     }
 
     pub fn has_block(&self, hash: &Hash256) -> bool {
@@ -537,8 +554,11 @@ impl ChainEngine {
         }
 
         let chainwork = parent_node
-            .map_or(0, |parent| parent.chainwork)
-            .saturating_add(approx_block_work(&block.header.difficulty_target));
+            .map_or(ChainWork::ZERO, |parent| parent.chainwork)
+            .checked_add(ChainWork::from_difficulty_target(
+                &block.header.difficulty_target,
+            ))
+            .ok_or(ChainEngineError::ChainWorkOverflow)?;
         self.nodes.insert(
             hash,
             StoredNode {
@@ -557,7 +577,6 @@ impl ChainEngine {
         &mut self,
         target_tip_hash: Hash256,
         hasher: &H,
-        miner_id: impl Into<String>,
     ) -> Result<HybridBlockReport, ChainEngineError> {
         let target_work = self
             .nodes
@@ -569,7 +588,7 @@ impl ChainEngine {
                 "staged branch does not exceed canonical chainwork".to_string(),
             ));
         }
-        self.reorganize_to(target_tip_hash, hasher, miner_id)
+        self.reorganize_to(target_tip_hash, hasher)
     }
 
     pub fn submit_block<H: RandomXHasher>(
@@ -587,6 +606,13 @@ impl ChainEngine {
         }
 
         block.verify_merkle_root()?;
+        let supplied_recipient = miner_id.into();
+        if supplied_recipient != block.reward_recipient {
+            return Err(ChainEngineError::RewardRecipientMismatch {
+                supplied: supplied_recipient,
+                committed: block.reward_recipient,
+            });
+        }
 
         let parent_node = if block.header.height == 0 {
             None
@@ -609,9 +635,15 @@ impl ChainEngine {
             ));
         }
 
-        let parent_work = parent_node.as_ref().map(|n| n.chainwork).unwrap_or(0);
-        let new_work =
-            parent_work.saturating_add(approx_block_work(&block.header.difficulty_target));
+        let parent_work = parent_node
+            .as_ref()
+            .map(|node| node.chainwork)
+            .unwrap_or(ChainWork::ZERO);
+        let new_work = parent_work
+            .checked_add(ChainWork::from_difficulty_target(
+                &block.header.difficulty_target,
+            ))
+            .ok_or(ChainEngineError::ChainWorkOverflow)?;
 
         let is_extending_tip = match (self.tip_hash(), &parent_node) {
             (Some(tip), Some(p)) => p.hash == tip,
@@ -629,7 +661,7 @@ impl ChainEngine {
                 &self.genesis_seed,
                 &block.txs,
                 &recent_hashes,
-                miner_id,
+                block.reward_recipient.clone(),
                 occupancy_ppm,
             )?;
 
@@ -655,7 +687,7 @@ impl ChainEngine {
             .tip_hash()
             .and_then(|h| self.nodes.get(&h))
             .map(|n| n.chainwork)
-            .unwrap_or(0);
+            .unwrap_or(ChainWork::ZERO);
 
         let parent_hash_opt = parent_node.map(|n| n.hash);
         self.nodes.insert(
@@ -670,7 +702,7 @@ impl ChainEngine {
         );
 
         if new_work > current_tip_work {
-            self.reorganize_to(block_hash, hasher, miner_id)
+            self.reorganize_to(block_hash, hasher)
         } else {
             Err(ChainEngineError::ReorgFailed(
                 "alternative branch does not exceed canonical chainwork".to_string(),
@@ -682,7 +714,6 @@ impl ChainEngine {
         &mut self,
         target_tip_hash: Hash256,
         hasher: &H,
-        miner_id: impl Into<String>,
     ) -> Result<HybridBlockReport, ChainEngineError> {
         let mut branch_hashes = Vec::new();
         let mut cursor = Some(target_tip_hash);
@@ -704,8 +735,6 @@ impl ChainEngine {
         let mut last_report: Option<HybridBlockReport> = None;
         let mut prev_header_opt: Option<BlockHeader> = None;
         let mut recent_hashes = Vec::new();
-        let miner_str = miner_id.into();
-
         for h in &branch_hashes {
             let node = self
                 .nodes
@@ -720,7 +749,7 @@ impl ChainEngine {
                 &self.genesis_seed,
                 &node.block.txs,
                 &recent_hashes,
-                miner_str.clone(),
+                node.block.reward_recipient.clone(),
                 node.occupancy_ppm,
             ) {
                 Ok(rep) => {
@@ -825,6 +854,28 @@ mod tests {
     use crate::params::ATOMIC_UNITS_PER_SUL;
     use crate::pow_randomx::MockRandomXHasher;
 
+    #[test]
+    fn block_merkle_root_commits_to_reward_recipient() {
+        let header = BlockHeader {
+            version: 1,
+            height: 0,
+            prev_block_hash: [0; 32],
+            merkle_root: compute_block_merkle_root(&[], "alice"),
+            timestamp: 1_700_000_000,
+            difficulty_target: [0xFF; 32],
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            reward_recipient: "bob".into(),
+            txs: Vec::new(),
+        };
+        assert!(matches!(
+            block.verify_merkle_root(),
+            Err(ChainEngineError::MerkleRootMismatch { .. })
+        ));
+    }
+
     fn mine_valid_header(
         hasher: &MockRandomXHasher,
         genesis_seed: &Hash256,
@@ -890,7 +941,7 @@ mod tests {
             &seed,
             0,
             [0; 32],
-            compute_merkle_root(&[]),
+            compute_block_merkle_root(&[], "miner_genesis"),
             1_700_000_000,
             [0xFF; 32],
         );
@@ -898,6 +949,7 @@ mod tests {
             .submit_block(
                 Block {
                     header: genesis,
+                    reward_recipient: "miner_genesis".into(),
                     txs: Vec::new(),
                 },
                 &hasher,
@@ -911,11 +963,12 @@ mod tests {
                 version: 1,
                 height: 1,
                 prev_block_hash: genesis_hash,
-                merkle_root: compute_merkle_root(&[]),
+                merkle_root: compute_block_merkle_root(&[], "miner_wrong_target"),
                 timestamp: 1_700_000_120,
                 difficulty_target: [0x7F; 32],
                 nonce: 0,
             },
+            reward_recipient: "miner_wrong_target".into(),
             txs: Vec::new(),
         };
         assert!(matches!(
@@ -930,11 +983,12 @@ mod tests {
                 version: 1,
                 height: 1,
                 prev_block_hash: genesis_hash,
-                merkle_root: compute_merkle_root(&[]),
+                merkle_root: compute_block_merkle_root(&[], "miner_mtp"),
                 timestamp: 1_700_000_000,
                 difficulty_target: [0xFF; 32],
                 nonce: 0,
             },
+            reward_recipient: "miner_mtp".into(),
             txs: Vec::new(),
         };
         assert!(matches!(
@@ -959,7 +1013,7 @@ mod tests {
             &genesis,
             0,
             [0u8; 32],
-            compute_merkle_root(&[]),
+            compute_block_merkle_root(&[], "miner_genesis"),
             1_700_000_000,
             [0xFF; 32],
         );
@@ -967,6 +1021,7 @@ mod tests {
             .submit_block(
                 Block {
                     header: genesis_header,
+                    reward_recipient: "miner_genesis".into(),
                     txs: Vec::new(),
                 },
                 &hasher,
@@ -980,7 +1035,7 @@ mod tests {
             &genesis,
             1,
             genesis_hash,
-            compute_merkle_root(&[]),
+            compute_block_merkle_root(&[], "miner_canonical"),
             1_700_000_120,
             target,
         );
@@ -988,6 +1043,7 @@ mod tests {
             .submit_block(
                 Block {
                     header: canonical_header,
+                    reward_recipient: "miner_canonical".into(),
                     txs: Vec::new(),
                 },
                 &hasher,
@@ -1002,7 +1058,7 @@ mod tests {
             &genesis,
             1,
             genesis_hash,
-            compute_merkle_root(&[]),
+            compute_block_merkle_root(&[], "miner_fork"),
             1_700_000_121,
             target,
         );
@@ -1010,6 +1066,7 @@ mod tests {
             engine.submit_block(
                 Block {
                     header: fork_header,
+                    reward_recipient: "miner_fork".into(),
                     txs: Vec::new(),
                 },
                 &hasher,
@@ -1019,7 +1076,14 @@ mod tests {
             Err(ChainEngineError::ReorgFailed(_))
         ));
 
-        let (fork_tip, fork_hash) = empty_block(&hasher, &genesis, 2, fork_hash, 1_700_000_241);
+        let (fork_tip, fork_hash) = empty_block_for(
+            &hasher,
+            &genesis,
+            2,
+            fork_hash,
+            1_700_000_241,
+            "miner_fork_tip",
+        );
         engine
             .submit_block(fork_tip, &hasher, "miner_fork_tip", occ)
             .unwrap();
@@ -1028,6 +1092,7 @@ mod tests {
         assert_ne!(engine.tip_hash(), Some(canonical_hash));
         assert!(canonical_miner_balance > 0);
         assert_eq!(engine.state.ledger.balance_of("miner_canonical"), 0);
+        assert!(engine.state.ledger.balance_of("miner_fork") > 0);
         assert!(engine.state.ledger.balance_of("miner_fork_tip") > 0);
     }
 
@@ -1045,7 +1110,7 @@ mod tests {
             &genesis,
             0,
             [0u8; 32],
-            compute_merkle_root(&[]),
+            compute_block_merkle_root(&[], "miner_genesis"),
             1_700_000_000,
             [0xFF; 32],
         );
@@ -1053,6 +1118,7 @@ mod tests {
             .submit_block(
                 Block {
                     header: genesis_header,
+                    reward_recipient: "miner_genesis".into(),
                     txs: Vec::new(),
                 },
                 &hasher,
@@ -1066,7 +1132,7 @@ mod tests {
             &genesis,
             1,
             genesis_hash,
-            compute_merkle_root(&[]),
+            compute_block_merkle_root(&[], "miner_canonical"),
             1_700_000_120,
             target,
         );
@@ -1074,6 +1140,7 @@ mod tests {
             .submit_block(
                 Block {
                     header: canonical_header,
+                    reward_recipient: "miner_canonical".into(),
                     txs: Vec::new(),
                 },
                 &hasher,
@@ -1094,7 +1161,7 @@ mod tests {
             0x11,
             occ,
         );
-        let bad_merkle = compute_merkle_root(std::slice::from_ref(&bad_tx));
+        let bad_merkle = compute_block_merkle_root(std::slice::from_ref(&bad_tx), "miner_bad_fork");
         let (bad_header, bad_hash) = mine_valid_header(
             &hasher,
             &genesis,
@@ -1108,6 +1175,7 @@ mod tests {
             engine.submit_block(
                 Block {
                     header: bad_header,
+                    reward_recipient: "miner_bad_fork".into(),
                     txs: vec![bad_tx],
                 },
                 &hasher,
@@ -1116,7 +1184,14 @@ mod tests {
             ),
             Err(ChainEngineError::ReorgFailed(_))
         ));
-        let (bad_tip, _) = empty_block(&hasher, &genesis, 2, bad_hash, 1_700_000_241);
+        let (bad_tip, _) = empty_block_for(
+            &hasher,
+            &genesis,
+            2,
+            bad_hash,
+            1_700_000_241,
+            "miner_bad_tip",
+        );
         let result = engine.submit_block(bad_tip, &hasher, "miner_bad_tip", occ);
 
         assert!(matches!(
@@ -1137,11 +1212,29 @@ mod tests {
         parent_hash: Hash256,
         timestamp: u64,
     ) -> (Block, Hash256) {
+        empty_block_for(
+            hasher,
+            genesis_seed,
+            height,
+            parent_hash,
+            timestamp,
+            "miner",
+        )
+    }
+
+    fn empty_block_for(
+        hasher: &MockRandomXHasher,
+        genesis_seed: &Hash256,
+        height: u64,
+        parent_hash: Hash256,
+        timestamp: u64,
+        reward_recipient: &str,
+    ) -> (Block, Hash256) {
         let mut header = BlockHeader {
             version: 1,
             height,
             prev_block_hash: parent_hash,
-            merkle_root: compute_merkle_root(&[]),
+            merkle_root: compute_block_merkle_root(&[], reward_recipient),
             timestamp,
             difficulty_target: [0xFF; 32],
             nonce: 0,
@@ -1152,6 +1245,7 @@ mod tests {
                 return (
                     Block {
                         header,
+                        reward_recipient: reward_recipient.to_string(),
                         txs: Vec::new(),
                     },
                     hash,
@@ -1202,11 +1296,12 @@ mod tests {
                 version: 1,
                 height: 0,
                 prev_block_hash: [0; 32],
-                merkle_root: compute_merkle_root(&[]),
+                merkle_root: compute_block_merkle_root(&[], "miner"),
                 timestamp: 1_700_000_000,
                 difficulty_target: [0xFF; 32],
                 nonce: 0,
             },
+            reward_recipient: "miner".into(),
             txs: Vec::new(),
         };
 

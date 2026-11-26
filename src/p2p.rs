@@ -5,7 +5,8 @@ use bincode::Options;
 
 use crate::antispam::Hash32;
 use crate::chain_engine::{
-    hybrid_tx_digest, Block, ChainEngine, ChainEngineError, StoredBlockInfo, MAX_BLOCK_TXS,
+    compute_block_merkle_root, hybrid_tx_digest, Block, ChainEngine, ChainEngineError,
+    StoredBlockInfo, MAX_BLOCK_TXS,
 };
 use crate::chain_state::{HybridChainError, HybridTx};
 use crate::params::{
@@ -13,18 +14,20 @@ use crate::params::{
     MAX_SYNC_ITERATIONS_PER_SESSION, MEDIAN_TIME_PAST_BLOCKS,
 };
 use crate::persistence::{DiskStore, PersistenceError};
-use crate::pow_randomx::{retarget_difficulty_with_window, BlockHeader, Hash256, RandomXHasher};
+use crate::pow_randomx::{
+    retarget_difficulty_with_window, BlockHeader, ChainWork, Hash256, RandomXHasher,
+};
 use crate::privacy::verify_confidential_tx_against_outputs;
 
 pub type PeerId = String;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_BATCH_BLOCKS: usize = MAX_SYNC_BLOCKS_PER_MESSAGE;
 pub const MAX_PEERS: usize = 64;
 pub const MAX_PENDING_BLOCKS: usize = 128;
 pub const MAX_SEEN_TX_DIGESTS: usize = 8_192;
 pub const MAX_ENCODED_MESSAGE_BYTES: u64 = 2 * 1024 * 1024;
-const MESSAGE_MAGIC: &[u8; 8] = b"SULP2P01";
+const MESSAGE_MAGIC: &[u8; 8] = b"SULP2P02";
 const FRAME_HEADER_SIZE: usize = 8 + 4 + 8;
 const CHECKSUM_SIZE: usize = 32;
 
@@ -33,7 +36,7 @@ pub struct PeerInfo {
     pub id: PeerId,
     pub tip_height: u64,
     pub tip_hash: Option<Hash256>,
-    pub tip_work: u128,
+    pub tip_work: ChainWork,
 }
 
 /// P2P synchronization is controlled-trust only while occupancy is not consensus-committed.
@@ -55,7 +58,7 @@ pub enum P2pMessage {
     Status {
         tip_height: u64,
         tip_hash: Option<Hash256>,
-        tip_work: u128,
+        tip_work: ChainWork,
     },
     GetHeaders {
         locator: Vec<Hash256>,
@@ -265,7 +268,7 @@ impl P2pNode {
         message: P2pMessage,
         engine: &mut ChainEngine,
         hasher: &H,
-        miner_id: &str,
+        _miner_id: &str,
     ) -> Result<Vec<OutboundPacket>, P2pError> {
         let mut outbound = Vec::new();
         match message {
@@ -287,7 +290,7 @@ impl P2pNode {
                     id: peer_id.clone(),
                     tip_height: 0,
                     tip_hash: None,
-                    tip_work: 0,
+                    tip_work: ChainWork::ZERO,
                 })?;
                 outbound.push(OutboundPacket {
                     to: peer_id,
@@ -421,7 +424,7 @@ impl P2pNode {
                     self.request_more_headers(&peer.id, engine, &mut outbound)?;
                 }
                 let old_tip = engine.tip_hash();
-                self.finish_sync_if_ready(&peer.id, engine, hasher, miner_id, &mut outbound)?;
+                self.finish_sync_if_ready(&peer.id, engine, hasher, &mut outbound)?;
                 if engine.tip_hash() != old_tip {
                     for other in self.peers.iter() {
                         if other.id != from {
@@ -510,7 +513,7 @@ impl P2pNode {
                     return Err(error);
                 }
                 let activated =
-                    self.finish_sync_if_ready(&provider, engine, hasher, miner_id, &mut outbound)?;
+                    self.finish_sync_if_ready(&provider, engine, hasher, &mut outbound)?;
                 if engine.tip_hash() != old_tip {
                     for peer in self.peers.iter() {
                         if peer.id != from {
@@ -709,7 +712,6 @@ impl P2pNode {
         peer_id: &str,
         engine: &mut ChainEngine,
         hasher: &H,
-        miner_id: &str,
         outbound: &mut Vec<OutboundPacket>,
     ) -> Result<bool, P2pError> {
         let ready = self.sync.sessions.get(peer_id).map_or(false, |session| {
@@ -753,7 +755,7 @@ impl P2pNode {
             .chainwork;
         let activated = target_work > engine.current_tip_work();
         if activated {
-            if let Err(error) = engine.activate_chain(target_hash, hasher, miner_id) {
+            if let Err(error) = engine.activate_chain(target_hash, hasher) {
                 self.abort_sync(peer_id, engine);
                 return Err(P2pError::Chain(error));
             }
@@ -1010,7 +1012,6 @@ fn persistence_error(error: PersistenceError) -> P2pError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_engine::compute_merkle_root;
     use crate::chain_state::HybridTx;
     use crate::ledger::TransferTx;
     use crate::params::ATOMIC_UNITS_PER_SUL;
@@ -1031,7 +1032,7 @@ mod tests {
             version: 1,
             height,
             prev_block_hash: parent_hash,
-            merkle_root: compute_merkle_root(&[]),
+            merkle_root: compute_block_merkle_root(&[], "miner"),
             timestamp,
             difficulty_target,
             nonce: 0,
@@ -1042,6 +1043,7 @@ mod tests {
         }
         Block {
             header,
+            reward_recipient: "miner".into(),
             txs: Vec::new(),
         }
     }
@@ -1103,6 +1105,16 @@ mod tests {
         let message = P2pMessage::Ping(42);
         let frame = encode_message(&message).unwrap();
         assert_eq!(decode_message(&frame).unwrap(), message);
+
+        let status = P2pMessage::Status {
+            tip_height: 9,
+            tip_hash: Some([0xA5; 32]),
+            tip_work: ChainWork::from_difficulty_target(&[0; 32]),
+        };
+        assert_eq!(
+            decode_message(&encode_message(&status).unwrap()).unwrap(),
+            status
+        );
 
         let mut damaged = frame.clone();
         let last = damaged.len() - 1;
@@ -1456,7 +1468,7 @@ mod tests {
                 vec![header_announcement(StoredBlockInfo {
                     hash: [0; 32],
                     parent_hash: Some(genesis_hash),
-                    chainwork: 0,
+                    chainwork: ChainWork::ZERO,
                     occupancy_ppm: 0,
                     block: empty_block(&seed, 1, genesis_hash, 1_700_000_120),
                 })],
@@ -1502,7 +1514,7 @@ mod tests {
         let announcement = header_announcement(StoredBlockInfo {
             hash: same_timestamp.header.structural_digest(),
             parent_hash: Some(genesis_hash),
-            chainwork: 0,
+            chainwork: ChainWork::ZERO,
             occupancy_ppm: 0,
             block: same_timestamp,
         });
@@ -1518,7 +1530,7 @@ mod tests {
         let announcement = header_announcement(StoredBlockInfo {
             hash: wrong_target.header.structural_digest(),
             parent_hash: Some(genesis_hash),
-            chainwork: 0,
+            chainwork: ChainWork::ZERO,
             occupancy_ppm: 0,
             block: wrong_target,
         });
@@ -1540,7 +1552,7 @@ mod tests {
                 id: "remote".into(),
                 tip_height: 0,
                 tip_hash: None,
-                tip_work: 0,
+                tip_work: ChainWork::ZERO,
             })
             .unwrap();
         let tx = HybridTx::Confidential {

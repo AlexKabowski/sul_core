@@ -5,14 +5,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::antispam::{solve_micro_pow, AntiSpamChallenge};
 use crate::chain_engine::{
-    compute_merkle_root, Block, ChainEngine, ChainEngineError, MAX_BLOCK_TXS,
+    compute_block_merkle_root, Block, ChainEngine, ChainEngineError, MAX_BLOCK_TXS,
 };
 use crate::chain_state::{HybridBlockReport, HybridChainError, HybridTx};
 use crate::ledger::TransferTx;
 use crate::monetary::OCCUPANCY_SCALE;
 use crate::params::ATOMIC_UNITS_PER_SUL;
 use crate::persistence::{DiskStore, PersistenceError};
-use crate::pow_randomx::{BlockHeader, ConsensusError, Hash256, RandomXHasher, RealRandomXHasher};
+use crate::pow_randomx::{
+    BlockHeader, ChainWork, ConsensusError, Hash256, RandomXHasher, RealRandomXHasher,
+};
 use crate::privacy::verify_confidential_tx_against_outputs;
 
 const DEFAULT_DATA_DIRECTORY: &str = ".sul-node";
@@ -26,7 +28,7 @@ const DEFAULT_MAX_NONCE_ATTEMPTS: u64 = 1_000_000;
 pub struct NodeStatus {
     pub height: Option<u64>,
     pub tip_hash: Option<Hash256>,
-    pub chainwork: u128,
+    pub chainwork: ChainWork,
     pub total_supply_atomic: u128,
     pub miner_reward_pool_atomic: u128,
     pub mempool_len: usize,
@@ -43,7 +45,7 @@ pub struct BalanceInfo {
 pub struct MinedBlock {
     pub hash: Hash256,
     pub height: u64,
-    pub chainwork: u128,
+    pub chainwork: ChainWork,
     pub transaction_count: usize,
 }
 
@@ -213,13 +215,14 @@ impl<'a> NodeRpc<'a> {
             ),
             None => (0, [0; 32]),
         };
+        let reward_recipient = miner_id.to_string();
         let previous_mempool = self.engine.mempool.clone();
         let txs = self.engine.mempool.drain_for_block(MAX_BLOCK_TXS);
         let mut header = BlockHeader {
             version: 1,
             height,
             prev_block_hash,
-            merkle_root: compute_merkle_root(&txs),
+            merkle_root: compute_block_merkle_root(&txs, &reward_recipient),
             timestamp,
             difficulty_target,
             nonce: 0,
@@ -252,7 +255,11 @@ impl<'a> NodeRpc<'a> {
             ));
         }
 
-        let block = Block { header, txs };
+        let block = Block {
+            header,
+            reward_recipient,
+            txs,
+        };
         let block_hash = block.header.structural_digest();
         let report = match self.engine.submit_block(
             block.clone(),
